@@ -63,8 +63,8 @@ SINGLE_VALUE_LOGIN_KEYS = {'totp', 'fido2Credentials'}
 # Text-capable conflict fields where merging or pre-filled editing makes sense
 EDITABLE_CONFLICT_FIELDS = {'notes', 'login.totp'}
 
-# Multi-value list fields that smart-merge combines and deduplicates
-MULTI_VALUE_ITEM_KEYS = {'fields', 'passwordHistory'}
+# Multi-value list fields that smart-merge combines and deduplicates (fields handled separately per identifier)
+MULTI_VALUE_ITEM_KEYS = {'passwordHistory'}
 MULTI_VALUE_LOGIN_KEYS = {'uris'}
 
 
@@ -364,14 +364,18 @@ def load_csv_vault(filepath: str):
 
                 normalized_items.append(item)
 
-            return normalized_items, vault_format, "csv"
+            # CSV exports do not store container UUIDs -> empty container_id_map
+            return normalized_items, vault_format, "csv", {}
 
     except Exception as e:
         sys.exit(f"Unexpected error while reading CSV '{filepath}': {e}")
 
 
 def load_json_vault(filepath: str, password_cache: list[str]):
-    """Loads a Bitwarden JSON export (unencrypted or encrypted) into normalized internal item dicts."""
+    """
+    Loads a Bitwarden JSON export (unencrypted or encrypted) into normalized internal item dicts,
+    and returns the container name -> UUID mapping so base-vault folder/collection IDs can be preserved.
+    """
     try:
         with open(filepath, mode='r', encoding='utf-8-sig') as f:
             data = json.load(f)
@@ -392,9 +396,11 @@ def load_json_vault(filepath: str, password_cache: list[str]):
     if 'collections' in data:
         vault_format = 'org'
         id_to_name = {c['id']: c['name'] for c in data.get('collections', []) if 'id' in c and 'name' in c}
+        name_to_id = {c['name']: c['id'] for c in data.get('collections', []) if 'id' in c and 'name' in c}
     else:
         vault_format = 'personal'
         id_to_name = {fld['id']: fld['name'] for fld in data.get('folders', []) if 'id' in fld and 'name' in fld}
+        name_to_id = {fld['name']: fld['id'] for fld in data.get('folders', []) if 'id' in fld and 'name' in fld}
 
     normalized_items = []
     for raw_item in data.get('items', []):
@@ -412,7 +418,7 @@ def load_json_vault(filepath: str, password_cache: list[str]):
 
         normalized_items.append(item)
 
-    return normalized_items, vault_format, "json"
+    return normalized_items, vault_format, "json", name_to_id
 
 
 def load_vault_auto(filepath: str, password_cache: list[str]):
@@ -627,13 +633,6 @@ def uri_dedup_key(u):
     return canonicalize(u)
 
 
-def field_dedup_key(f):
-    """Deduplicates custom fields by (name, value)."""
-    if isinstance(f, dict):
-        return (f.get('name') or '', f.get('value') or '')
-    return canonicalize(f)
-
-
 def read_single_key(prompt_text: str) -> str:
     """Reads a single keypress immediately without requiring Enter (cross-platform)."""
     sys.stdout.write(prompt_text)
@@ -764,7 +763,10 @@ def prompt_multiline_editor(field_path: str, prefill: str) -> str:
 
 
 def resolve_group_conflicts_interactively(group, conflicts: dict):
-    """Interactively resolves single-value conflicts for a smart-merge group."""
+    """
+    Interactively resolves single-value and custom-field conflicts for a smart-merge group.
+    Returns (resolved_top_dict, resolved_login_dict, resolved_custom_fields_dict).
+    """
     item_name = group[-1][0].get('name') or "<Unnamed>"
     login_user = (group[-1][0].get('login') or {}).get('username') or "-"
     print("\n" + "=" * 60)
@@ -773,6 +775,7 @@ def resolve_group_conflicts_interactively(group, conflicts: dict):
 
     resolved_top = {}
     resolved_login = {}
+    resolved_custom_fields = {}
 
     for field_path, options in conflicts.items():
         print(f"\nField '{field_path}' has {len(options)} conflicting values:")
@@ -780,9 +783,9 @@ def resolve_group_conflicts_interactively(group, conflicts: dict):
             display_val = repr(val) if isinstance(val, str) else str(val)
             print(f"  [{idx}] {display_val}   (from: {', '.join(srcs)})")
 
-        can_merge_or_edit = field_path in EDITABLE_CONFLICT_FIELDS
+        can_merge_or_edit = (field_path in EDITABLE_CONFLICT_FIELDS) or field_path.startswith("field.")
         if can_merge_or_edit:
-            merged_suggestion = "\n".join(str(v) for v, _ in options if v)
+            merged_suggestion = "\n".join(str(v) for v, _ in options if v is not None and str(v) != "")
             print("  [m] Merge all values (joined with newline)")
             print("  [e] Edit pre-filled value inline (use \\n for newlines)")
             print("  [n] Enter multi-line text (press Enter for new lines, '.' to finish)")
@@ -808,16 +811,19 @@ def resolve_group_conflicts_interactively(group, conflicts: dict):
 
         if field_path.startswith("login."):
             resolved_login[field_path.split(".", 1)[1]] = chosen_val
+        elif field_path.startswith("field."):
+            resolved_custom_fields[field_path.split(".", 1)[1]] = chosen_val
         else:
             resolved_top[field_path] = chosen_val
 
     print("=" * 60 + "\n")
-    return resolved_top, resolved_login
+    return resolved_top, resolved_login, resolved_custom_fields
 
 
 def inspect_and_merge_group(group, interactive: bool = False):
     """
-    Attempts to smart-merge a group of (item, sources).
+    Attempts to smart-merge a group of (item, sources), checking both single-value fields
+    and custom fields (by field identifier/name) for value conflicts.
     Returns:
       - status: 'merged' | 'conflict'
       - items_with_meta: list of (item, sources, conflict_details_dict)
@@ -878,14 +884,45 @@ def inspect_and_merge_group(group, interactive: bool = False):
                 only_val = next(iter(val_map.values()))[0]
                 resolved_login[lkey] = copy.deepcopy(only_val)
 
+    # 3. Inspect custom fields grouped by identifier (field 'name') for conflicting values
+    field_order = []  # preserves order of distinct field identifiers
+    field_val_maps = {}  # fname -> {fval: [raw_val, sources, template_field_dict]}
+
+    for itm, srcs in group:
+        for fld in (itm.get('fields') or []):
+            if not isinstance(fld, dict):
+                continue
+            fname = (fld.get('name') or '').strip()
+            fval = fld.get('value') if fld.get('value') is not None else ''
+            if fname not in field_val_maps:
+                field_order.append(fname)
+                field_val_maps[fname] = {}
+            vmap = field_val_maps[fname]
+            if fval not in vmap:
+                vmap[fval] = [fval, list(srcs), copy.deepcopy(fld)]
+            else:
+                vmap[fval][1] = list(dict.fromkeys(vmap[fval][1] + list(srcs)))
+                # Prefer richer JSON field metadata (non-zero type or linkedId) if available
+                if fld.get('type', 0) != 0 or fld.get('linkedId') is not None:
+                    vmap[fval][2] = copy.deepcopy(fld)
+
+    for fname in field_order:
+        vmap = field_val_maps[fname]
+        if len(vmap) > 1:
+            display_fname = fname if fname else "<unnamed>"
+            conflicts[f"field.{display_fname}"] = [(entry[0], entry[1]) for entry in vmap.values()]
+
+    # Handle conflicts: either resolve interactively or report them cleanly
+    resolved_custom_fields = {}
     if conflicts:
         if interactive:
-            user_top, user_login = resolve_group_conflicts_interactively(group, conflicts)
+            user_top, user_login, resolved_custom_fields = resolve_group_conflicts_interactively(group, conflicts)
             resolved_top.update(user_top)
             resolved_login.update(user_login)
         else:
             return 'conflict', [(copy.deepcopy(itm), list(srcs), conflicts) for itm, srcs in group]
 
+    # Apply resolved single-value fields
     for k, v in resolved_top.items():
         base[k] = v
 
@@ -903,12 +940,31 @@ def inspect_and_merge_group(group, interactive: bool = False):
                 ]
                 base['login'][lkey] = merge_object_lists(ordered_lists, key_fn=uri_dedup_key)
 
+    # Reconstruct merged custom fields list
+    if field_order:
+        merged_fields = []
+        for fname in field_order:
+            vmap = field_val_maps[fname]
+            display_fname = fname if fname else "<unnamed>"
+            if display_fname in resolved_custom_fields:
+                chosen_val = resolved_custom_fields[display_fname]
+                # Use matching template if user picked an existing value, otherwise first template
+                template = copy.deepcopy(vmap[chosen_val][2]) if chosen_val in vmap else copy.deepcopy(next(iter(vmap.values()))[2])
+                template['name'] = fname
+                template['value'] = chosen_val
+                merged_fields.append(template)
+            else:
+                only_entry = next(iter(vmap.values()))
+                merged_fields.append(copy.deepcopy(only_entry[2]))
+        base['fields'] = merged_fields
+
+    # Merge remaining multi-value top-level lists (passwordHistory)
     for key in MULTI_VALUE_ITEM_KEYS:
         all_lists = [itm.get(key, []) for itm, _ in group]
         if any(all_lists):
-            kfn = field_dedup_key if key == 'fields' else canonicalize
-            base[key] = merge_object_lists(all_lists, key_fn=kfn)
+            base[key] = merge_object_lists(all_lists, key_fn=canonicalize)
 
+    # Merge _collections if in org mode
     if '_collections' in base:
         merged_cols = list(dict.fromkeys(
             c for itm, _ in group for c in itm.get('_collections', [])
@@ -997,7 +1053,7 @@ def compute_import_diff(unique_records, base_filename, interactive: bool = False
 
 
 # ==============================================================================
-# Terminal & File Report Builders
+# Terminal & Markdown Report Builders
 # ==============================================================================
 
 def get_item_display_info(item, target_format):
@@ -1097,7 +1153,7 @@ def build_summary_report(
     mode: str = "",
     input_files: list[str] = None
 ) -> str:
-    """Builds the formatted result report string (compact or detailed)."""
+    """Builds the formatted terminal result report string (compact or detailed)."""
     lines = []
     total_entries = len(records)
 
@@ -1112,7 +1168,6 @@ def build_summary_report(
             lines.append(f"Input Files    : {', '.join(input_files)}")
         lines.append(f"Total Entries  : {total_entries}")
 
-        # Breakdown by item type
         type_counts = {}
         archived_count = 0
         for itm, _, _, _ in records:
@@ -1268,7 +1323,6 @@ def build_markdown_report(
     lines = ["# Bitwarden Vault Report", ""]
     total_entries = len(records)
 
-    # 1. Metadata & Overview Table
     lines.append("## Overview")
     lines.append("")
     lines.append("| Property | Value |")
@@ -1296,8 +1350,6 @@ def build_markdown_report(
             lines.append(f"| **Archived Items** | {archived_count} |")
 
     lines.append("")
-
-    # 2. Result List grouped by Folder / Collection
     lines.append(f"## Result List ({total_entries} {'entry' if total_entries == 1 else 'entries'})")
     lines.append("")
 
@@ -1412,14 +1464,13 @@ def build_markdown_report(
 
                     lines.append("")
 
-    # 3. Post-Processing Summary for import-diff
     if mode == "import-diff" and (entries_to_delete or unresolved_conflicts):
         container_label = "Folder" if target_format == "personal" else "Collection"
         empty_label = f"(No {container_label})"
 
         lines.append("---")
         lines.append("")
-        lines.append(f"## Pre-Import Checklist for `{base_filename}`")
+        lines.append(f"## Post-Import Checklist for `{base_filename}`")
         lines.append("")
 
         if entries_to_delete:
@@ -1468,19 +1519,28 @@ def build_markdown_report(
 
     return "\n".join(lines).strip() + "\n"
 
+
 # ==============================================================================
 # Export Builders (JSON and CSV)
 # ==============================================================================
 
-def build_export_json(items, target_format):
-    """Reconstructs a valid Bitwarden JSON export with fresh UUIDs for folders/collections and items."""
+def build_export_json(items, target_format, preserved_id_map: dict = None):
+    """
+    Reconstructs a valid Bitwarden JSON export.
+    When preserved_id_map is provided (e.g., from the base vault in 'import-diff'),
+    existing folder/collection UUIDs are reused so Bitwarden maps items into existing containers.
+    """
     export_items = []
+    known_ids = preserved_id_map or {}
 
     if target_format == 'personal':
         folder_names = sorted(dict.fromkeys(
             itm.get('_folder', "") for itm in items if itm.get('_folder')
         ))
-        name_to_id = {fname: str(uuid.uuid4()) for fname in folder_names}
+        name_to_id = {
+            fname: known_ids.get(fname) or str(uuid.uuid4())
+            for fname in folder_names
+        }
         folders_array = [{"id": fid, "name": fname} for fname, fid in name_to_id.items()]
 
         for itm in items:
@@ -1502,7 +1562,10 @@ def build_export_json(items, target_format):
         col_names = sorted(dict.fromkeys(
             cname for itm in items for cname in itm.get('_collections', []) if cname
         ))
-        name_to_id = {cname: str(uuid.uuid4()) for cname in col_names}
+        name_to_id = {
+            cname: known_ids.get(cname) or str(uuid.uuid4())
+            for cname in col_names
+        }
         collections_array = [
             {"id": cid, "organizationId": None, "name": cname, "externalId": None}
             for cname, cid in name_to_id.items()
@@ -1672,7 +1735,7 @@ def main():
         help=(
             "Smart-merge near-identical entries and report conflicts:\n"
             "  - Matches entries with same identity OR same folder/collection + username + password + >=1 shared URI\n"
-            "  - Deduplicates 'uris', 'fields', 'passwordHistory', and 'collections'\n"
+            "  - Deduplicates 'uris', 'passwordHistory', and 'collections'; checks custom fields by name for value conflicts\n"
             "  - Combines 'favorite', 'notes', 'reprompt', 'totp', and 'fido2Credentials' if only one entry has content"
         )
     )
@@ -1718,6 +1781,7 @@ def main():
     item_lists = [x[0] for x in loaded_items]
     vault_formats = [x[1] for x in loaded_items]
     file_formats = [x[2] for x in loaded_items]
+    container_id_maps = [x[3] for x in loaded_items]
 
     all_inputs_csv = all(ff == "csv" for ff in file_formats)
     has_json_input = "json" in file_formats
@@ -1755,6 +1819,12 @@ def main():
         [convert_item_format(itm, fmt, effective_vault_format) for itm in items]
         for items, fmt in zip(item_lists, vault_formats)
     ]
+
+    # Preserve folder/collection UUIDs from the base vault (1st file) when in import-diff mode
+    # and the base vault shares the target structure
+    preserved_container_ids = {}
+    if args.mode == "import-diff" and vault_formats[0] == effective_vault_format:
+        preserved_container_ids = container_id_maps[0]
 
     basenames = [os.path.basename(f) for f in args.files]
     display_names = basenames if len(set(basenames)) == len(basenames) else args.files
@@ -1812,7 +1882,7 @@ def main():
             base_records, display_names[0], interactive=args.resolve_conflicts
         )
 
-    # 4. Build and display the summary / detailed report
+    # 4. Build and display the summary / detailed report in terminal
     report_text = build_summary_report(
         records,
         effective_vault_format,
@@ -1830,7 +1900,11 @@ def main():
         final_output_path = resolve_output_filename(raw_output_path, out_file_format, args.encrypt)
 
         if out_file_format == "json":
-            export_payload = build_export_json(final_items, effective_vault_format)
+            export_payload = build_export_json(
+                final_items,
+                effective_vault_format,
+                preserved_id_map=preserved_container_ids
+            )
             if args.encrypt:
                 out_pwd = args.password if args.password else resolve_output_encryption_password()
                 export_payload = encrypt_bitwarden_payload(export_payload, out_pwd)
@@ -1880,7 +1954,6 @@ def main():
         )
 
     # 6. Build and display consolidated post-processing summary for import-diff
-    diff_summary_text = ""
     if args.mode == "import-diff":
         diff_summary_text = build_import_diff_summary(
             entries_to_delete,
