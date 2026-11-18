@@ -365,7 +365,7 @@ def load_csv_vault(filepath: str):
                 normalized_items.append(item)
 
             # CSV exports do not store container UUIDs -> empty container_id_map
-            return normalized_items, vault_format, "csv", {}
+            return normalized_items, vault_format, "csv", {}, False
 
     except Exception as e:
         sys.exit(f"Unexpected error while reading CSV '{filepath}': {e}")
@@ -387,7 +387,8 @@ def load_json_vault(filepath: str, password_cache: list[str]):
     if not isinstance(data, dict):
         sys.exit(f"Error in '{filepath}': Root JSON element must be an object.")
 
-    if data.get('encrypted') is True:
+    was_encrypted = data.get('encrypted') is True
+    if was_encrypted:
         data = decrypt_bitwarden_payload(data, filepath, password_cache)
 
     if 'items' not in data:
@@ -418,7 +419,7 @@ def load_json_vault(filepath: str, password_cache: list[str]):
 
         normalized_items.append(item)
 
-    return normalized_items, vault_format, "json", name_to_id
+    return normalized_items, vault_format, "json", name_to_id, was_encrypted
 
 
 def load_vault_auto(filepath: str, password_cache: list[str]):
@@ -432,10 +433,15 @@ def load_vault_auto(filepath: str, password_cache: list[str]):
     elif ext == '.json':
         return load_json_vault(filepath, password_cache)
 
-    with open(filepath, mode='r', encoding='utf-8-sig') as f:
-        prefix = f.read(64).lstrip()
-    if prefix.startswith('{'):
-        return load_json_vault(filepath, password_cache)
+    # Fallback for custom extensions (e.g., .enc, .bak, .txt): try parsing as JSON first
+    try:
+        with open(filepath, mode='r', encoding='utf-8-sig') as f:
+            raw_content = f.read().lstrip()
+        if raw_content.startswith('{'):
+            return load_json_vault(filepath, password_cache)
+    except UnicodeDecodeError:
+        sys.exit(f"Error: '{filepath}' is not valid UTF-8 text (binary files are not supported).")
+
     return load_csv_vault(filepath)
 
 
@@ -1668,12 +1674,12 @@ def write_export_csv(items, target_format, filepath):
     return len(rows), skipped_unsupported_types
 
 
-def print_csv_data_loss_warnings(all_inputs_csv: bool, has_json_input: bool, is_csv_output: bool, skipped_count: int = 0):
-    """Displays data loss warnings ONLY when actual metadata/feature loss can occur."""
-    if all_inputs_csv and is_csv_output:
+def print_csv_data_loss_warnings(has_csv_input: bool, has_json_input: bool, is_csv_output: bool, skipped_count: int = 0):
+    """Displays data loss warnings ONLY when CSV is actually involved."""
+    if not has_csv_input and not is_csv_output:
         return
 
-    if has_json_input and not all_inputs_csv:
+    if has_json_input and has_csv_input:
         print(
             "WARNING (Mixed CSV + JSON Input): CSV files lack advanced Bitwarden JSON metadata "
             "(such as passwordHistory, URI match rules, custom field types, passkeys/FIDO2, and SSH keys). "
@@ -1693,8 +1699,23 @@ def print_csv_data_loss_warnings(all_inputs_csv: bool, has_json_input: bool, is_
             )
 
 
-def resolve_output_encryption_password() -> str:
-    """Prompts for an encryption password with confirmation."""
+def resolve_output_encryption_password(password_cache: list[str], all_inputs_encrypted: bool) -> str:
+    """
+    Prompts for an output encryption password.
+    If all input files were encrypted with the exact same password, offers reusing it via single-key prompt.
+    """
+    if all_inputs_encrypted and len(password_cache) == 1:
+        while True:
+            choice = read_single_key(
+                "All input files used the same password. Reuse this password to encrypt output? (y/n): "
+            )
+            if choice == 'y':
+                return password_cache[0]
+            elif choice == 'n':
+                break
+            else:
+                print("Invalid key. Please press 'y' or 'n'.")
+
     while True:
         pwd1 = getpass.getpass("Enter password to encrypt output JSON: ")
         if not pwd1:
@@ -1810,9 +1831,13 @@ def main():
     vault_formats = [x[1] for x in loaded_items]
     file_formats = [x[2] for x in loaded_items]
     container_id_maps = [x[3] for x in loaded_items]
+    encrypted_flags = [x[4] for x in loaded_items]
+
+    all_inputs_encrypted = all(encrypted_flags)
 
     all_inputs_csv = all(ff == "csv" for ff in file_formats)
     has_json_input = "json" in file_formats
+    has_csv_input = "csv" in file_formats
 
     # Determine effective output file format
     if args.output_format:
@@ -1934,17 +1959,22 @@ def main():
                 preserved_id_map=preserved_container_ids
             )
             if args.encrypt:
-                out_pwd = args.password if args.password else resolve_output_encryption_password()
+                out_pwd = (
+                    args.password
+                    if args.password
+                    else resolve_output_encryption_password(password_cache, all_inputs_encrypted)
+                )
                 export_payload = encrypt_bitwarden_payload(export_payload, out_pwd)
 
             try:
                 with open(final_output_path, mode='w', encoding='utf-8') as f:
                     json.dump(export_payload, f, indent=2, ensure_ascii=False)
-                print_csv_data_loss_warnings(
-                    all_inputs_csv=all_inputs_csv,
-                    has_json_input=has_json_input,
-                    is_csv_output=False
-                )
+                if has_json_input and has_csv_input:
+                    print_csv_data_loss_warnings(
+                        has_csv_input=has_csv_input,
+                        has_json_input=has_json_input,
+                        is_csv_output=False
+                    )
                 enc_label = "encrypted " if args.encrypt else ""
                 print(
                     f"Done! {len(final_items)} entries saved in {enc_label}"
@@ -1971,11 +2001,12 @@ def main():
             except PermissionError:
                 sys.exit(f"Error: Permission denied when writing to '{final_output_path}' (is the file currently open?).")
     else:
-        print_csv_data_loss_warnings(
-            all_inputs_csv=all_inputs_csv,
-            has_json_input=has_json_input,
-            is_csv_output=False
-        )
+        if has_json_input and not all_inputs_csv:
+            print_csv_data_loss_warnings(
+                has_csv_input=has_csv_input,
+                has_json_input=has_json_input,
+                is_csv_output=False
+            )
         print(
             f"Preview only (--list): {len(records)} entries found "
             f"({effective_vault_format} structure), no vault file written."
