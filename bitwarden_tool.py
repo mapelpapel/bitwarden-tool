@@ -778,19 +778,30 @@ def resolve_group_conflicts_interactively(group, conflicts: dict):
     resolved_custom_fields = {}
 
     for field_path, options in conflicts.items():
+        is_custom_field = field_path.startswith("field.")
+        can_merge_or_edit = (field_path in EDITABLE_CONFLICT_FIELDS) or is_custom_field
+
         print(f"\nField '{field_path}' has {len(options)} conflicting values:")
         for idx, (val, srcs) in enumerate(options, start=1):
             display_val = repr(val) if isinstance(val, str) else str(val)
             print(f"  [{idx}] {display_val}   (from: {', '.join(srcs)})")
 
-        can_merge_or_edit = (field_path in EDITABLE_CONFLICT_FIELDS) or field_path.startswith("field.")
         if can_merge_or_edit:
             merged_suggestion = "\n".join(str(v) for v, _ in options if v is not None and str(v) != "")
-            print("  [m] Merge all values (joined with newline)")
+            print("  [m] Merge all values into one field (joined with newline)")
             print("  [e] Edit pre-filled value inline (use \\n for newlines)")
             print("  [n] Enter multi-line text (press Enter for new lines, '.' to finish)")
+        if is_custom_field:
+            print("  [k] Keep all as separate custom fields with the same name")
 
-        valid_hint = f"1-{len(options)}" + (", m, e, n" if can_merge_or_edit else "")
+        extra_keys = []
+        if can_merge_or_edit:
+            extra_keys.extend(["m", "e", "n"])
+        if is_custom_field:
+            extra_keys.append("k")
+
+        valid_hint = f"1-{len(options)}" + (f", {', '.join(extra_keys)}" if extra_keys else "")
+
         while True:
             choice = read_single_key(f"Choose option ({valid_hint}): ")
 
@@ -806,12 +817,15 @@ def resolve_group_conflicts_interactively(group, conflicts: dict):
             elif can_merge_or_edit and choice == 'n':
                 chosen_val = prompt_multiline_editor(field_path, merged_suggestion)
                 break
+            elif is_custom_field and choice == 'k':
+                chosen_val = [copy.deepcopy(opt[0]) for opt in options]
+                break
             else:
                 print(f"Invalid key. Please press {valid_hint}.")
 
         if field_path.startswith("login."):
             resolved_login[field_path.split(".", 1)[1]] = chosen_val
-        elif field_path.startswith("field."):
+        elif is_custom_field:
             resolved_custom_fields[field_path.split(".", 1)[1]] = chosen_val
         else:
             resolved_top[field_path] = chosen_val
@@ -947,12 +961,26 @@ def inspect_and_merge_group(group, interactive: bool = False):
             vmap = field_val_maps[fname]
             display_fname = fname if fname else "<unnamed>"
             if display_fname in resolved_custom_fields:
-                chosen_val = resolved_custom_fields[display_fname]
-                # Use matching template if user picked an existing value, otherwise first template
-                template = copy.deepcopy(vmap[chosen_val][2]) if chosen_val in vmap else copy.deepcopy(next(iter(vmap.values()))[2])
-                template['name'] = fname
-                template['value'] = chosen_val
-                merged_fields.append(template)
+                resolution = resolved_custom_fields[display_fname]
+                # [k] Keep all variants as separate fields with the same identifier
+                if isinstance(resolution, list):
+                    for val_item in resolution:
+                        if val_item in vmap:
+                            merged_fields.append(copy.deepcopy(vmap[val_item][2]))
+                        else:
+                            template = copy.deepcopy(next(iter(vmap.values()))[2])
+                            template['name'] = fname
+                            template['value'] = val_item
+                            merged_fields.append(template)
+                else:
+                    template = (
+                        copy.deepcopy(vmap[resolution][2])
+                        if resolution in vmap
+                        else copy.deepcopy(next(iter(vmap.values()))[2])
+                    )
+                    template['name'] = fname
+                    template['value'] = resolution
+                    merged_fields.append(template)
             else:
                 only_entry = next(iter(vmap.values()))
                 merged_fields.append(copy.deepcopy(only_entry[2]))
